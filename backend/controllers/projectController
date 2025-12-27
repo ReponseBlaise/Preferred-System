@@ -1,0 +1,173 @@
+// ============================================
+// controllers/projectController.js - NEW
+// ============================================
+
+const db = require('../config/database');
+
+// Get user's accessible projects
+exports.getUserProjects = async (req, res) => {
+    try {
+        const result = await db.query(
+            'SELECT * FROM get_user_projects($1)',
+            [req.user.id]
+        );
+
+        res.json({
+            success: true,
+            count: result.rows.length,
+            data: result.rows
+        });
+    } catch (error) {
+        console.error('Get user projects error:', error);
+        res.status(500).json({ error: { message: 'Server error' } });
+    }
+};
+
+// Get all projects (Manager only)
+exports.getAllProjects = async (req, res) => {
+    try {
+        const { status } = req.query;
+        let query = 'SELECT * FROM projects WHERE 1=1';
+        const params = [];
+        let paramCount = 1;
+
+        if (status) {
+            query += ` AND status = $${paramCount}`;
+            params.push(status);
+            paramCount++;
+        }
+
+        query += ' ORDER BY created_at DESC';
+
+        const result = await db.query(query, params);
+
+        res.json({
+            success: true,
+            count: result.rows.length,
+            data: result.rows
+        });
+    } catch (error) {
+        console.error('Get projects error:', error);
+        res.status(500).json({ error: { message: 'Server error' } });
+    }
+};
+
+// Create project (Manager only)
+exports.createProject = async (req, res) => {
+    try {
+        const { project_name, project_code, location, description, start_date, budget } = req.body;
+
+        const result = await db.query(
+            `INSERT INTO projects (project_name, project_code, location, description, start_date, budget, manager_id) 
+             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+            [project_name, project_code, location, description, start_date, budget, req.user.id]
+        );
+
+        // Automatically assign manager to the project
+        await db.query(
+            'INSERT INTO project_assignments (user_id, project_id, assigned_role, assigned_by) VALUES ($1, $2, $3, $4)',
+            [req.user.id, result.rows[0].id, 'manager', req.user.id]
+        );
+
+        res.status(201).json({
+            success: true,
+            data: result.rows[0]
+        });
+    } catch (error) {
+        console.error('Create project error:', error);
+        res.status(500).json({ error: { message: 'Server error' } });
+    }
+};
+
+// Assign user to project (Manager only)
+exports.assignUserToProject = async (req, res) => {
+    try {
+        const { user_id, project_id, assigned_role } = req.body;
+
+        const result = await db.query(
+            `INSERT INTO project_assignments (user_id, project_id, assigned_role, assigned_by) 
+             VALUES ($1, $2, $3, $4) 
+             ON CONFLICT (user_id, project_id) 
+             DO UPDATE SET assigned_role = $3
+             RETURNING *`,
+            [user_id, project_id, assigned_role, req.user.id]
+        );
+
+        res.status(201).json({
+            success: true,
+            data: result.rows[0]
+        });
+    } catch (error) {
+        console.error('Assign user error:', error);
+        res.status(500).json({ error: { message: 'Server error' } });
+    }
+};
+
+// Get project statistics
+exports.getProjectStats = async (req, res) => {
+    try {
+        const { project_id } = req.params;
+
+        // Verify access
+        const hasAccess = await db.query(
+            'SELECT user_has_project_access($1, $2) as has_access',
+            [req.user.id, project_id]
+        );
+
+        if (!hasAccess.rows[0].has_access) {
+            return res.status(403).json({ error: { message: 'Access denied to this project' } });
+        }
+
+        // Get statistics
+        const employeeCount = await db.query(
+            'SELECT COUNT(*) FROM employees WHERE project_id = $1 AND is_active = true',
+            [project_id]
+        );
+
+        const todayAttendance = await db.query(
+            `SELECT COUNT(*) FROM attendance 
+             WHERE project_id = $1 AND attendance_date = CURRENT_DATE`,
+            [project_id]
+        );
+
+        const inventoryValue = await db.query(
+            'SELECT COALESCE(SUM(total_value), 0) as total FROM inventory WHERE project_id = $1',
+            [project_id]
+        );
+
+        const monthExpenses = await db.query(
+            `SELECT COALESCE(SUM(amount), 0) as total FROM expenses 
+             WHERE project_id = $1
+             AND EXTRACT(MONTH FROM expense_date) = EXTRACT(MONTH FROM CURRENT_DATE)
+             AND EXTRACT(YEAR FROM expense_date) = EXTRACT(YEAR FROM CURRENT_DATE)`,
+            [project_id]
+        );
+
+        const monthPayroll = await db.query(
+            `SELECT COALESCE(SUM(a.hours_worked * e.rate_per_day), 0) as total
+             FROM attendance a
+             JOIN employees e ON a.employee_id = e.id
+             WHERE a.project_id = $1
+             AND EXTRACT(MONTH FROM a.attendance_date) = EXTRACT(MONTH FROM CURRENT_DATE)
+             AND EXTRACT(YEAR FROM a.attendance_date) = EXTRACT(YEAR FROM CURRENT_DATE)`,
+            [project_id]
+        );
+
+        res.json({
+            success: true,
+            data: {
+                totalEmployees: parseInt(employeeCount.rows[0].count),
+                todayAttendance: parseInt(todayAttendance.rows[0].count),
+                inventoryValue: parseFloat(inventoryValue.rows[0].total),
+                monthExpenses: parseFloat(monthExpenses.rows[0].total),
+                monthPayroll: parseFloat(monthPayroll.rows[0].total)
+            }
+        });
+    } catch (error) {
+        console.error('Project stats error:', error);
+        res.status(500).json({ error: { message: 'Server error' } });
+    }
+};
+
+
+
